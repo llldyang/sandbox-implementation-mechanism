@@ -8,6 +8,7 @@
 4. **必须读当前源码。** Codex 的 Linux 默认实现已是 Bubblewrap；Claude Code 产品文档仍不宣称原生 Windows 沙箱，但公开 SRT 源码已加入 Windows 后端；Gemini 的 Windows 原生后端也不只是“Docker 的另一种写法”。[R1、D2、R7、R10]
 5. **开启 sandbox 不等于默认断网、不能读取家目录、具备 VM 级隔离。** 文件读取、写入、网络、IPC、提权和例外机制应分别核查。[D1、D2、D3、D6、R13]
 6. **Hermes Agent 有可选沙箱，但默认本地后端不是沙箱。** `terminal.backend` 默认为 `local`；只有切换到 Docker、Singularity、Modal 等隔离环境，或把 Hermes 整体放进 Docker / OpenShell，才会得到相应的 OS 边界。[D9、R16]
+7. **本地与云端不是强弱关系，而是风险转移。** 本地执行避免把完整工作区交给远端运行环境，但会接触开发者机器上的文件、凭据和内网；云端执行更容易做到每任务 VM、集中出口控制和销毁，却引入代码驻留、快照、云端密钥与多租户治理问题。[D11–D15]
 
 ## 2. 产品 × 操作系统总览
 
@@ -127,7 +128,36 @@ Docker 后端会创建长期运行的容器，再通过 `docker exec` 执行后�
 - **本地容器不等于“宿主的一切都隔离了”。** Docker Desktop 的 Linux 容器位于 Linux VM 中，但宿主共享目录仍然是明确打开的访问面；OpenHands 的 DockerWorkspace 也允许额外挂载目录。[D7、R15]
 - **机制不是完整安全证明。** 产品安装版本、系统内核、Windows build、挂载配置和网络配置不同，实际保证就可能不同。本文不据静态分析为任何产品出具“不可逃逸”保证。
 
-## 6. 如果要选型或实现自己的 Agent
+## 6. 本地开发与企业云端：沙箱边界怎样变化
+
+### 6.1 先分清四种部署形态
+
+| 场景 | 执行位置 | 主要优势 | 最容易被忽略的风险 | 合适的控制 |
+|---|---|---|---|---|
+| 个人本地 | 开发者工作站 | 工具链完整、延迟低、代码无需复制到远端执行机 | Agent 继承用户能读到的家目录、凭据、浏览器状态和内网可达性 | OS 沙箱、workspace 读写边界、按命令审批、项目专用假凭据 |
+| 企业受管本地 | 受 MDM/组策略/企业配置管理的工作站或 VDI | 保留本地体验，同时由管理员强制最低限制 | 用户配置可能与管理策略叠加；本地插件、MCP、GUI 和沙箱外重跑可能另走通道 | 强制 sandbox、禁用 bypass、受管网络/MCP、设备身份、集中审计 |
+| 厂商托管云端 | 厂商提供的每任务容器、VM 或 microVM | 易并行、易销毁、与员工终端隔开，可集中做出口与生命周期管理 | 代码、构建产物、对话、快照和密钥进入厂商控制面；默认网络未必收紧 | 仓库级授权、每任务隔离、短期凭据、出口 allowlist、保留期、PR 人工复核 |
+| 企业自托管或混合 | 企业 VM/Kubernetes/开发容器，或云编排器连接本地 executor | 数据驻留、私网和基础设施由企业控制 | 企业同时承担镜像修补、租户隔离、凭据代理、回收和审计责任；云策略不一定自动下发到本地 executor | 每用户/每工作负载环境、出站连接、独立服务身份、密钥代理、失败即回收 |
+
+### 6.2 几个产品的实际落点
+
+- **Codex / ChatGPT Work：** [Agent Security](https://learn.chatgpt.com/docs/enterprise/agent-security) 将 Global、Local、Codex Cloud 分成不同策略作用域；Work Cloud 又有单独的 capability permissions。本地限制不会自动变成云容器限制，云端网络 allowlist 也不会自动限制托管 web search、apps 或远端 MCP。[OpenAI Sandbox Security](https://developers.openai.com/api/docs/guides/agents-api/environments/security) 建议按用户或工作负载拆环境，把应用密钥留在沙箱外，并用代理向批准的目的地注入第三方凭据。自托管 executor 只需向 OpenAI 发起出站连接，并使用只能连接环境的受限 key，具体见 [Self-hosted sandboxes](https://developers.openai.com/api/docs/guides/agents-api/environments/self-hosted)。[D11、D12]
+- **Claude Code：** [Desktop 文档](https://code.claude.com/docs/en/desktop) 区分 Local、Cloud 与 SSH。Local 直接接触本机项目；Cloud 在 Anthropic 基础设施继续运行且没有 bypass permissions；SSH 把执行移到企业自己的主机，但主机隔离、补丁和网络仍由企业负责。企业可通过 managed settings、MDM 和 SSH host allowlist 限制入口。[D13]
+- **Cursor：** [Cloud Agent Security](https://cursor.com/docs/cloud-agent/security) 描述每 agent 独立的 Firecracker microVM、独立 AWS 账户、加密与生命周期；运行时 VM 会回收，但会话和快照有各自保留规则。[Secrets & Network](https://cursor.com/docs/cloud-agent/security-network) 显示云端互联网默认可用，企业应选择 allowlist-only 并锁定策略。Self-Hosted Machine 使用企业机器自身的防火墙、代理和网络规则，云端的锁定策略不会替代这些控制。[D14]
+- **GitHub Copilot：** [Cloud and local sandboxes](https://docs.github.com/en/copilot/concepts/security-governance-and-network-settings/about-cloud-and-local-sandboxes) 将本地 OS sandbox 与远端、短生命周期 Linux 环境分开。本地沙箱目前默认关闭；企业可以用 [managed settings](https://docs.github.com/en/copilot/reference/enterprise-administrators/enterprise-managed-settings) 强制最低文件、网络、凭据及 MCP/LSP 限制。云端是否允许使用则由组织或企业的 cloud sandbox policy 控制。[D15]
+- **Hermes、OpenHands、OpenCode：** 这些项目本身没有与上述厂商云相同的统一企业策略面。Docker、SSH、Modal、远程 workspace 或 Kubernetes 只是执行位置；租户隔离、镜像供应链、网络出口、密钥代理、日志和清理要由部署方补齐。OpenCode 若不外包进容器/VM，依然没有 OS 沙箱。
+
+### 6.3 企业落地时至少要回答七个问题
+
+1. **谁能启动任务：** 用户身份、服务身份和仓库授权是否同时校验，Agent 能否访问触发者本来无权访问的仓库。
+2. **任务之间怎样隔离：** 是共享容器、独立容器、microVM 还是完整 VM；缓存、Docker daemon、宿主 socket 是否跨租户共享。
+3. **凭据怎样进入：** 长期 key 是否直接成为环境变量；能否改用短期 OIDC、占位 token 或宿主侧凭据代理。
+4. **出口怎样收紧：** 默认全通、默认域名加 allowlist，还是 allowlist-only；MCP、浏览器、web search、package manager 是否经过同一出口策略。
+5. **什么会持久化：** 工作区、volume、快照、会话、日志、artifact 和构建缓存分别保留多久，能否按事件删除。
+6. **策略由谁强制：** 用户能否关闭 sandbox、切到 bypass、添加 MCP 或批准全量网络；Global、Local、Cloud 规则发生冲突时谁优先。
+7. **结果怎样进入主分支：** 云端 Agent 应优先产出可审计 branch/PR，由 CI、代码所有者和人工复核决定是否合并，不把“沙箱内成功”当成发布授权。
+
+## 7. 如果要选型或实现自己的 Agent
 
 以下是基于上述证据的工程建议，而不是产品安全等级排名：
 
@@ -139,7 +169,7 @@ Docker 后端会创建长期运行的容器，再通过 `docker exec` 执行后�
 
 建议验收使用无敏感数据的临时目录、假凭据和自有测试服务：检查项目外读写、符号链接、子进程继承、直接网络连接、宿主 socket/管道访问、后台子进程清理、沙箱依赖失效及审批后边界变化。**这些是后续建议，本文没有执行这些测试。**
 
-## 7. 固定源码快照
+## 8. 固定源码快照
 
 以下为本次查询得到的默认分支提交；提交时间已换算为 Asia/Shanghai。它们不是稳定版版本号，也不表示同一秒钟的原子快照。
 
@@ -157,7 +187,7 @@ Docker 后端会创建长期运行的容器，再通过 `docker exec` 执行后�
 
 Hermes Agent 更新较快，本次补充按 2026-10-07 可见的 `main` 阅读，并保留 `main` 链接；后续复查时应重新固定提交。
 
-## 8. 资料与源码索引
+## 9. 资料与源码索引
 
 源码链接固定到上述提交，便于复查。一个编号可对应多个互补证据；`#L` 为 GitHub 源文件行号。产品文档是调研时访问的在线页面，可能随发布更新。
 
@@ -177,6 +207,14 @@ Hermes Agent 更新较快，本次补充按 2026-10-07 可见的 `main` 阅读�
 - D9 — Hermes Agent security policy：`https://github.com/NousResearch/hermes-agent/blob/main/SECURITY.md`
 - D9 — Hermes Agent security guide：`https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/security.md`
 - D10 — NVIDIA OpenShell sandbox architecture：`https://github.com/NVIDIA/OpenShell/blob/main/architecture/sandbox.md`
+- D11 — OpenAI Agent Security：[https://learn.chatgpt.com/docs/enterprise/agent-security](https://learn.chatgpt.com/docs/enterprise/agent-security)
+- D12 — OpenAI sandbox security：[https://developers.openai.com/api/docs/guides/agents-api/environments/security](https://developers.openai.com/api/docs/guides/agents-api/environments/security)
+- D12 — OpenAI self-hosted sandboxes：[https://developers.openai.com/api/docs/guides/agents-api/environments/self-hosted](https://developers.openai.com/api/docs/guides/agents-api/environments/self-hosted)
+- D13 — Claude Code Desktop / Local / Cloud / SSH：[https://code.claude.com/docs/en/desktop](https://code.claude.com/docs/en/desktop)
+- D14 — Cursor Cloud Agent Security：[https://cursor.com/docs/cloud-agent/security](https://cursor.com/docs/cloud-agent/security)
+- D14 — Cursor Secrets & Network：[https://cursor.com/docs/cloud-agent/security-network](https://cursor.com/docs/cloud-agent/security-network)
+- D15 — GitHub Copilot cloud and local sandboxes：[https://docs.github.com/en/copilot/concepts/security-governance-and-network-settings/about-cloud-and-local-sandboxes](https://docs.github.com/en/copilot/concepts/security-governance-and-network-settings/about-cloud-and-local-sandboxes)
+- D15 — GitHub Copilot enterprise managed settings：[https://docs.github.com/en/copilot/reference/enterprise-administrators/enterprise-managed-settings](https://docs.github.com/en/copilot/reference/enterprise-administrators/enterprise-managed-settings)
 
 ### 固定提交源码
 

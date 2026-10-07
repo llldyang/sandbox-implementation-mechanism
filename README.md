@@ -25,4 +25,5 @@
 - Linux 的 Bubblewrap、namespace、seccomp 和代理桥；
 - Windows 的 Restricted Token、独立用户、ACL、Job Object、WFP 与 PSEC；
 - Hermes Agent 的可插拔终端后端、Docker 加固与整进程隔离；
+- 个人本地、企业受管本地、厂商云端和企业自托管环境的边界差异；
 - 容器后端和只做权限提示的工具分别能提供什么边界。

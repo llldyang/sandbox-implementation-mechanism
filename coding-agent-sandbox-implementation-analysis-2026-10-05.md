@@ -668,17 +668,114 @@ OpenShell 的边界更系统：非 root 且身份不可变、零 capabilities、
 | Hermes Docker backend | 容器文件系统与显式 volumes；文件工具另有 safe-root 检查 | 默认允许 Docker 网络；可选 `--network=none` / Iron Proxy | 长期容器 + `docker exec` | 默认 local 无隔离；持久化和网络默认开启；插件/MCP 需整进程隔离 |
 | OpenCode / OpenHands Local | 宿主原权限 | 宿主网络 | 普通宿主进程 | 没有内建 OS 沙箱 |
 
-## 11. 从这些源码可以提炼出的实现原则
+## 11. 同一套 Agent 在本地与企业云端怎样落地
 
-### 11.1 策略应保留“读、写、拒绝”的结构直到平台编译层
+### 11.1 先把编排面和执行面分开
+
+本地 Agent 往往把编排、审批和执行放在同一台机器；云端产品通常拆成控制面与短生命周期 executor。两者的关键数据流不同：
+
+```text
+本地：模型/编排器 → 本机策略编译器 → OS sandbox → 本机文件、凭据和内网
+
+云端：身份/仓库授权 → 云编排器 → 每任务 VM/容器
+                                   ├─ 临时 checkout
+                                   ├─ 受控网络出口
+                                   ├─ 短期凭据/凭据代理
+                                   └─ artifact、签名 commit、draft PR
+
+混合：云编排器 → 出站长连接 → 企业 executor → 企业文件与私网
+```
+
+沙箱只位于执行面。审批、模型、仓库授权、远端 MCP 和浏览器可能在控制面或另一服务里，不能因为 executor 在 VM 内就默认全链路都受同一 policy 约束。
+
+### 11.2 企业受管本地：OS 沙箱之外还需要不可绕过的配置层
+
+本地执行的好处是代码和构建上下文不必复制到厂商运行环境，开发工具也最完整；代价是 Agent 离 SSH key、浏览器登录态、云 CLI 凭据和企业内网很近。企业配置应当先收紧宿主可见面，再把允许的 workspace 和网络逐项加回：
+
+```text
+MDM / managed settings / requirements
+  → 禁止关闭 sandbox 与 bypass
+  → 固定 read/write/deny 根
+  → 固定网络代理和域名上限
+  → 限制本地 MCP、插件、hooks、GUI
+  → 记录审批、策略命中和沙箱外执行
+```
+
+用户偏好只能在管理员上限内变窄，不能把 deny 改成 allow。还要单独检查内建文件工具、远端 MCP、浏览器工具和“审批后在沙箱外重跑”，因为它们可能不经过终端 sandbox。OpenAI 的 [Agent Security](https://learn.chatgpt.com/docs/enterprise/agent-security)、GitHub 的 [enterprise managed settings](https://docs.github.com/en/copilot/reference/enterprise-administrators/enterprise-managed-settings) 和 Claude 的 [managed Desktop 配置](https://code.claude.com/docs/en/desktop) 都采用了“组织约束优先于用户设置”的思路，但字段与覆盖面并不相同。
+
+### 11.3 厂商托管云端：重点从“保护我的电脑”转为“隔离任务与控制数据流”
+
+云端 executor 不接触员工整台工作站，但会持有仓库副本、依赖、构建输出和任务凭据。一个较完整的生命周期可以写成：
+
+```python
+principal = authenticate(user_or_service)
+repo_scope = authorize_repo(principal, requested_repo)
+policy = resolve_org_team_environment_policy(principal, repo_scope)
+
+sandbox = provision_isolated_runtime(
+    image_digest=policy.image,
+    tenant_id=run_id,
+    cpu_memory_limits=policy.resources,
+)
+repo_token = issue_short_lived_token(repo_scope, ttl=run_ttl)
+workspace = sandbox.checkout(repo_token)
+configure_egress(sandbox, policy.allowed_destinations)
+attach_secret_broker(sandbox, opaque_tokens_only=True)
+
+result = sandbox.run(agent_task)
+export_artifacts(result, retention=policy.retention)
+open_reviewable_pr(result.signed_commits)
+revoke(repo_token)
+destroy_or_hibernate(sandbox, policy.lifecycle)
+```
+
+这不是某一产品的源码，而是从各家云端说明中抽出的最小控制链。最关键的是：
+
+- **租户边界：** 每任务 VM/microVM 比共享宿主进程更容易解释，但仍要核查缓存、镜像层、快照和宿主服务；
+- **仓库授权：** 同时校验组织安装范围与触发用户权限，不给 Agent 扩大访问面；
+- **凭据：** 首选短期、最小 scope 的 token 或宿主代理，不把长期 key 烘进镜像、日志或普通环境变量；
+- **出口：** 代码 exfiltration 的主要通道是网络。默认全通适合兼容性，不适合作为企业基线；浏览器、MCP 与 web search 还要分别配置；
+- **持久化：** VM 回收不代表快照、会话、日志和 artifact 同时删除，保留策略必须逐类核查；
+- **交付：** 默认输出 branch 或 draft PR，让 CI、CODEOWNERS、签名和人工 review 成为沙箱外的第二道门。
+
+[Cursor Cloud Agent Security](https://cursor.com/docs/cloud-agent/security) 给出了每 agent Firecracker microVM、独立账户和不同数据保留面的例子；[GitHub Copilot cloud sandbox](https://docs.github.com/en/copilot/concepts/security-governance-and-network-settings/about-cloud-and-local-sandboxes) 使用短生命周期 Linux 环境；[OpenAI Sandbox Security](https://developers.openai.com/api/docs/guides/agents-api/environments/security) 则强调按用户或工作负载隔离、收紧出口并把长期凭据留在环境外。
+
+### 11.4 企业自托管与混合执行：控制力更大，运维责任也全部回来
+
+自托管不是“云端功能搬进内网”这么简单。企业需要负责基础镜像更新、内核/runtime 补丁、节点多租户、日志脱敏、异常容器回收、缓存清理和容量隔离。共享一个长期 workspace 给多个用户，会让文件、凭据和后台进程跨任务残留；至少应按用户或工作负载拆环境。
+
+混合模式还必须分别求解两份有效策略：
+
+```text
+effective_orchestrator_policy = global_cloud_policy + identity/repo controls
+effective_executor_policy     = device policy + local sandbox/network controls
+effective_access              = 两侧限制的交集
+```
+
+不要假设云端 allowlist 会自动下发到本地执行器，也不要假设本机 MDM 会约束云端容器。OpenAI [Self-hosted sandboxes](https://developers.openai.com/api/docs/guides/agents-api/environments/self-hosted) 使用 executor 主动发起的出站 WebSocket 和受限 environment key；Claude 提供 Cloud 与 SSH 两种远端路径；Cursor Self-Hosted Machines 则使用企业机器自身的防火墙、代理和网络策略。这些模式都把更多 enforcement 责任交给部署方。
+
+### 11.5 验收表要同时覆盖本地与云端
+
+| 验收项 | 本地/受管本地 | 企业云端/自托管 |
+|---|---|---|
+| 文件 | 项目外读写、家目录、符号链接、宿主 socket | repo scope、跨任务卷、共享缓存、snapshot 恢复 |
+| 网络 | 直连绕代理、localhost、企业内网、VPN | 默认出口、私网隧道、artifact 域名、跨租户服务 |
+| 凭据 | SSH agent、浏览器、云 CLI、keychain | repo token TTL、OIDC、secret broker、日志脱敏 |
+| 生命周期 | 后台子进程、ACL/WFP 恢复、工作区残留 | VM 销毁、快照/会话/artifact 保留、token 撤销 |
+| 策略 | MDM 优先级、用户能否 bypass、MCP/插件范围 | 组织/团队/环境覆盖、用户 override、控制面与执行面差异 |
+| 交付 | 本地 diff 与 commit 审核 | 签名 commit、draft PR、CI、CODEOWNERS、合并权限 |
+
+## 12. 从这些源码可以提炼出的实现原则
+
+### 12.1 策略应保留“读、写、拒绝”的结构直到平台编译层
 
 过早把它们压成“工作区可写”会丢失 `.git` 只读、秘密文件不可读、嵌套 carve-out 等语义。Codex、SRT 和 Gemini 新 manager 都在平台层仍携带分开的路径集合。
 
-### 11.2 mount/规则顺序是安全逻辑，不只是参数排列
+### 12.2 mount/规则顺序是安全逻辑，不只是参数排列
 
 典型安全顺序是“宽泛基线 → 开放必要根 → 重新覆盖敏感子路径 → 最后追加不可绕开的 deny”。Bubblewrap 和 Seatbelt 实现都依赖这个顺序。父/子路径排序错误会让宽泛父挂载遮掉精细子挂载。
 
-### 11.3 网络 allowlist 至少需要两层
+### 12.3 网络 allowlist 至少需要两层
 
 域名属于应用层语义，namespace/WFP/Seatbelt 属于内核强制。较完整的设计是：
 
@@ -690,29 +787,30 @@ OpenShell 的边界更系统：非 root 且身份不可变、零 capabilities、
 
 只设置 `HTTPS_PROXY` 没有强制力；只给 namespace 断网则无法提供受控网络。
 
-### 11.4 helper 必须位于被约束进程之外，但又不能被它操纵
+### 12.4 helper 必须位于被约束进程之外，但又不能被它操纵
 
 SRT 用嵌套 PID namespace 让用户命令看不到未过滤的 socat；Codex 限制 app-server/daemon Unix socket；Windows 独立用户让 surrogate spawn 仍带 sandbox SID。这些代码都在解决同一个问题：代理、runner、broker 本身如果能被不可信命令附加、注入或通过 IPC 调用，沙箱就可能被“借权”。
 
-### 11.5 缺失能力必须显式失败或显式降级
+### 12.5 缺失能力必须显式失败或显式降级
 
 较好的源码证据包括：Codex WSL1 提前拒绝、SRT nested namespace 失败即中止、MXC 请求级 capability probe、Gemini 指定 runtime 不存在时报错。反例是 Gemini Windows 的网络限速设置失败只 warning；调用方若需要严格断网，就不能把该分支视为满足要求。
 
-### 11.6 修改宿主 ACL/完整性标签需要事务与恢复
+### 12.6 修改宿主 ACL/完整性标签需要事务与恢复
 
 namespace/Seatbelt 规则通常随进程消失；Windows ACL、mandatory label、WFP provider 和本地账户是持久状态。SRT 用 holder 引用计数与 restore/revoke；MXC 记录孤儿 DACL 状态；Codex 有独立 setup/uninstall 流程。任何自研 Windows 沙箱都需要把“恢复失败”和“进程崩溃后清理”当成主流程，而不是附加脚本。
 
-## 12. 结论
+## 13. 结论
 
 从固定仓库源码看，主流实现大致分为三种工程路线：
 
 1. **本地策略编译器**：Codex、SRT、Gemini 新 manager 把统一权限模型编译成 Seatbelt/Bubblewrap/Windows 原语，启动快、与本地工具兼容，但需要大量平台专用的路径、IPC 和失败处理。
 2. **统一执行容器层**：MXC 把策略变成后端配置，并在 Windows 走 PSEC/ProcessContainer，在其他平台接 Bubblewrap/Seatbelt。抽象更统一，但保证取决于后端 capability 和 SDK 成熟度。
 3. **外部环境后端**：OpenHands Docker/Apptainer 把 agent server 放入容器；Hermes 可以只把工具调用送入 Docker，也可以包装整个主进程。边界强度由镜像、挂载、网络、凭据与 runtime 参数共同决定。OpenHands LocalWorkspace、Hermes 默认 local 和 OpenCode 则没有 OS 隔离层。
+4. **企业云端执行面**：每任务 VM/microVM 把风险从员工终端移到远端运行环境。它能改善任务隔离和集中治理，但只有在仓库授权、短期凭据、出口、保留期、审计和 PR 复核同时落地时，才构成完整的企业边界。
 
 不能用一个“已开启 sandbox”的布尔值比较它们。实际验收至少要分别检查：项目外读取、写入、符号链接、Unix socket/命名管道、直接网络、代理绕过、子进程与后台进程、提权路径、持久 ACL，以及底层能力缺失时的行为。
 
-## 13. 源码索引
+## 14. 源码与部署资料索引
 
 - Codex Linux：[README](https://github.com/openai/codex/blob/7f892275e31002f0422477c6219189284560e689/codex-rs/linux-sandbox/README.md)、[`linux_run_main.rs`](https://github.com/openai/codex/blob/7f892275e31002f0422477c6219189284560e689/codex-rs/linux-sandbox/src/linux_run_main.rs)、[`bwrap.rs`](https://github.com/openai/codex/blob/7f892275e31002f0422477c6219189284560e689/codex-rs/linux-sandbox/src/bwrap.rs)、[`landlock.rs`](https://github.com/openai/codex/blob/7f892275e31002f0422477c6219189284560e689/codex-rs/linux-sandbox/src/landlock.rs)
 - Codex macOS：[`seatbelt.rs`](https://github.com/openai/codex/blob/7f892275e31002f0422477c6219189284560e689/codex-rs/sandboxing/src/seatbelt.rs)
@@ -725,3 +823,7 @@ namespace/Seatbelt 规则通常随进程消失；Windows ACL、mandatory label�
 - OpenHands：[`DockerWorkspace`](https://github.com/OpenHands/software-agent-sdk/blob/de30ec0111fc1c1435a1639d4ec27aead297d5b8/openhands-workspace/openhands/workspace/docker/workspace.py)、[`LocalWorkspace`](https://github.com/OpenHands/software-agent-sdk/blob/de30ec0111fc1c1435a1639d4ec27aead297d5b8/openhands-sdk/openhands/sdk/workspace/local.py)
 - Hermes Agent（2026-10-07 读取 `main`）：[`SECURITY.md`](https://github.com/NousResearch/hermes-agent/blob/main/SECURITY.md)、[`config_defaults.py`](https://github.com/NousResearch/hermes-agent/blob/main/hermes_cli/config_defaults.py)、[`docker.py`](https://github.com/NousResearch/hermes-agent/blob/main/tools/environments/docker.py)、[`code_execution_tool.py`](https://github.com/NousResearch/hermes-agent/blob/main/tools/code_execution_tool.py)、[`file_tools.py`](https://github.com/NousResearch/hermes-agent/blob/main/tools/file_tools.py)、[`file_safety.py`](https://github.com/NousResearch/hermes-agent/blob/main/agent/file_safety.py)、[`Dockerfile`](https://github.com/NousResearch/hermes-agent/blob/main/Dockerfile)、[`docker-compose.yml`](https://github.com/NousResearch/hermes-agent/blob/main/docker-compose.yml)
 - NVIDIA OpenShell：[`architecture/sandbox.md`](https://github.com/NVIDIA/OpenShell/blob/main/architecture/sandbox.md)
+- OpenAI：[Agent Security](https://learn.chatgpt.com/docs/enterprise/agent-security)、[Sandbox Security](https://developers.openai.com/api/docs/guides/agents-api/environments/security)、[Self-hosted sandboxes](https://developers.openai.com/api/docs/guides/agents-api/environments/self-hosted)
+- Claude Code：[Desktop / Local / Cloud / SSH](https://code.claude.com/docs/en/desktop)、[Claude Code in the cloud](https://code.claude.com/docs/en/claude-code-on-the-web)
+- Cursor：[Cloud Agent Security](https://cursor.com/docs/cloud-agent/security)、[Secrets & Network](https://cursor.com/docs/cloud-agent/security-network)
+- GitHub Copilot：[Cloud and local sandboxes](https://docs.github.com/en/copilot/concepts/security-governance-and-network-settings/about-cloud-and-local-sandboxes)、[Enterprise managed settings](https://docs.github.com/en/copilot/reference/enterprise-administrators/enterprise-managed-settings)
