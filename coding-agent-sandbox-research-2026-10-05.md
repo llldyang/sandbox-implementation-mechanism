@@ -18,7 +18,7 @@
 | OpenAI Codex | Seatbelt，动态生成策略并调用 `sandbox-exec` | 当前源码默认 Bubblewrap；叠加 seccomp、`no_new_privs`；Landlock 为旧路线且受限 | 原生有 elevated / unelevated 路线；源码另有 MXC 选择；WSL2 走 Linux 后端 | Rust 核心和 OS 后端公开 [D1、R1–R5] |
 | Claude Code | Seatbelt，限制命令及子进程 | Bubblewrap + 网络 namespace/代理，另有 seccomp 辅助限制 | 产品文档支持 WSL2，仍称不支持原生 Windows；**SRT 源码已含原生 Windows 实现，但不能据此宣称 Claude Code 已发布支持** | 产品文档 + 公开 `anthropics/sandbox-runtime` [D2、R6、R7] |
 | Gemini CLI | Seatbelt；也可 Docker/Podman | Docker/Podman，可显式选择 runsc；源码另含 Bubblewrap 执行器 | 配置代码接受 `windows-native`，也有容器路线；不能把存在于源码等同默认启用 | CLI 包装器、配置、平台执行器公开 [D3、R8–R10] |
-| Cursor Agent | Seatbelt | 官方说明为 Landlock，兼容性需要时回退 Bubblewrap | Windows 通过 WSL2 使用 Linux 路线，不是同一套原生 Windows 隔离 | 官方产品/工程说明；未据公开资料重建完整内部调用链 [D4] |
+| Cursor Agent | Seatbelt，动态 profile 约束整个子进程树 | Landlock + seccomp + overlay；兼容性需要时回退 Bubblewrap | Windows 通过 WSL2 使用 Linux 路线，不是同一套原生 Windows 隔离 | [Run Modes](https://cursor.com/docs/agent/security/run-modes)、[工程实现说明](https://cursor.com/blog/agent-sandboxing)；未公开完整内部调用链 |
 | VS Code Local / Agent Host 自定义终端 | SRT 路线，底层 Seatbelt | SRT 路线，底层 Bubblewrap | 原生 Windows 使用 MXC；WSL2 按 Linux 处理；有预览状态和系统前提 | VS Code 集成层公开；当前源码包名为 `@vscode/sandbox-runtime`；不代表 Agent Host 内建 shell [D5、R11、R12] |
 | GitHub Copilot CLI | MXC 的 Seatbelt 后端 | MXC 的 Bubblewrap 后端 | MXC ProcessContainer 的 BaseContainer；不使用 AppContainer 回退，要求相应 Windows 能力 | CLI 本地沙箱整体仍为实验性，且默认关闭；不与 VS Code 集成混为一谈 [D6、R13] |
 | Hermes Agent | 默认 `local`，无 Hermes 原生 Seatbelt 后端；可把终端放入 Docker/远端环境，或包装整个进程 | 默认 `local`，无内建 Bubblewrap/Landlock 后端；可选 Docker、Singularity、Modal、SSH 等 | 原生运行时默认同样是 `local`；Docker Desktop 路线借助 Linux VM/WSL2，不是 Hermes 原生 Windows 沙箱 | “有 sandbox backend”不等于默认受隔离；插件、MCP、hooks 等是否被覆盖取决于只隔离终端还是包装整个进程 [D9、R16] |
@@ -115,7 +115,7 @@ Docker 后端会创建长期运行的容器，再通过 `docker exec` 执行后�
 
 **OpenHands：** 当前架构将很多执行能力放在 software-agent-sdk 中。`DockerWorkspace` 创建运行 agent server 的 Docker 容器，通过远程 workspace 接口操作；`LocalWorkspace` 直接读写宿主并执行命令。当前主仓库 README 也明确警告本地启动方式拥有宿主文件系统访问。因此必须注明具体 backend，不能以产品名推断保护边界。[R15]
 
-**Cursor：** 本文只将官方文档披露的 Seatbelt / Landlock / Bubblewrap / WSL2 路线列为证据。没有可对应本次产品构建的完整公开实现，不能进一步声称已审计它的内部 mount 规则、seccomp filter 或完整逃逸防护。[D4]
+**Cursor：** [Run Modes](https://cursor.com/docs/agent/security/run-modes) 说明了 `sandbox.json`、读边界、网络模式和沙箱外重跑；[工程实现说明](https://cursor.com/blog/agent-sandboxing) 给出了 Seatbelt、Landlock + seccomp + overlay、WSL2 等平台路线。由于没有可对应本次产品构建的完整公开实现，仍不能声称已审计内部 mount 顺序、完整 seccomp filter 或逃逸防护。[D4]
 
 ## 5. 跨产品比较时最容易遗漏的边界
 

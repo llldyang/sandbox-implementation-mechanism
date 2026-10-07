@@ -434,13 +434,17 @@ ResumeThread(child.Thread);
 
 ## 5. Cursor：公开资料说明了后端，但没有可复原的完整源码调用链
 
-原文链接到 Cursor 的产品文档与工程博客，而不是与特定产品构建对应的完整沙箱仓库。能可靠陈述的实现只有：
+[Cursor Run Modes](https://cursor.com/docs/agent/security/run-modes) 说明了用户实际能配置的边界，[Cursor 的工程文章](https://cursor.com/blog/agent-sandboxing) 则给出各平台的实现选择：
 
-- macOS 用 Seatbelt；
-- Linux 优先 Landlock，兼容性需要时回退 Bubblewrap；
-- Windows 经 WSL2 使用 Linux 路线。
+- **macOS：** 使用 `sandbox-exec` 调用 Seatbelt。SBPL profile 在运行时按 workspace、管理员策略和 `.cursorignore` 生成，并作用于整个子进程树。文章列出的保护目标包括 `.git/config`、`.git/hooks`、`.vscode`、`.cursorignore` 以及部分 `.cursor` 配置。
+- **Linux：** 以 Landlock 限制文件系统、seccomp 拦截危险 syscall，并通过 overlay filesystem 把被忽略的文件覆盖为不可读、不可写。当前产品文档还暴露 `CURSOR_SANDBOX_LANDLOCK_STATUS`：`fully_enforced` 表示 Landlock 路线，`bubblewrap` 表示兼容回退。沙箱会创建 user namespace，进程在 namespace 内可能显示为 UID 0；真实宿主 UID/GID 通过 `CURSOR_ORIG_UID`、`CURSOR_ORIG_GID` 传入。
+- **Windows：** 工程文章说明当前将 Linux 沙箱运行在 WSL2 内，并非一套原生 Windows Seatbelt/Landlock 等价实现。
 
-无法仅凭这些链接回答它怎样排序 mount、具体过滤哪些 syscall、怎样处理符号链接竞态或降级失败。本文不把 Codex/SRT 的细节移植到 Cursor；那会把相同底层原语误写成相同实现。
+`sandbox.json` 控制网络、附加可读/可写路径、临时目录和共享构建缓存；workspace 级配置优先于用户级配置，但不能削弱团队策略和 Cursor 的硬编码保护。终端命令默认可读写 workspace，网络先阻断，再按所选网络模式和域名列表放行。Read Access 的默认值仍是 `System`；切到 `Workspace` 后，项目外读取才需要审批或命中 read allowlist。
+
+沙箱只覆盖能够进入该路径的 shell 命令。Auto-review 的 allowlist 命令、Fetch、MCP，以及因限制失败后获准在沙箱外重跑的命令，都需要单独看待；官方文档也明确说分类器不是安全边界。
+
+Cursor 没有公开与某个产品构建一一对应的完整沙箱仓库，因此仍无法独立复原 mount 的精确顺序、完整 seccomp 规则、符号链接竞态处理和全部降级分支。这里不套用 Codex 或 SRT 的内部细节。
 
 ## 6. VS Code、MXC 与 GitHub Copilot CLI
 
@@ -515,7 +519,9 @@ CreateProcessW(command, EXTENDED_STARTUPINFO_PRESENT, startup_info)?;
 
 ### 6.3 GitHub Copilot CLI
 
-原文对 Copilot CLI 的证据是产品文档与 MXC 仓库，不包含 Copilot CLI 自身的完整实现仓库。可以确认它集成 MXC；无法从现有链接独立重建 CLI 怎样把每项设置传入 MXC。Windows 使用 BaseContainer、而不采用通用 MXC AppContainer 回退，是产品集成选择，不是 MXC SDK 本身的必然行为。
+[GitHub Copilot 沙箱文档](https://docs.github.com/en/copilot/concepts/security-governance-and-network-settings/about-cloud-and-local-sandboxes) 可以确认 CLI 的跨平台后端：macOS 使用 Seatbelt，Linux 使用 Bubblewrap，Windows 使用 MXC ProcessContainer 的 BaseContainer tier。Windows 不采用 MXC 的 AppContainer fallback；如果系统不能提供 BaseContainer，CLI 会报告不支持，而不是换到更弱的 tier。
+
+同一文档还区分了 shell/MCP/LSP 与 CLI 内建文件工具：前一类可以进入 OS sandbox，内建文件工具在 CLI 进程内执行，只能自行检查 policy。远端 MCP 也不在本地 sandbox 内。结合 [MXC 仓库](https://github.com/microsoft/mxc) 可以解释 Windows 的底层机制，但 Copilot CLI 自身没有提供可对应本次版本的完整实现仓库，因此不能独立还原 CLI 怎样把每项设置转换为 MXC policy。
 
 ## 7. OpenCode：权限提示直接执行宿主操作，没有 OS enforcement 层
 
