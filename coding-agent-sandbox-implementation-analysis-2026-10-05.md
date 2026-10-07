@@ -701,7 +701,66 @@ MDM / managed settings / requirements
   → 记录审批、策略命中和沙箱外执行
 ```
 
-用户偏好只能在管理员上限内变窄，不能把 deny 改成 allow。还要单独检查内建文件工具、远端 MCP、浏览器工具和“审批后在沙箱外重跑”，因为它们可能不经过终端 sandbox。OpenAI 的 [Agent Security](https://learn.chatgpt.com/docs/enterprise/agent-security)、GitHub 的 [enterprise managed settings](https://docs.github.com/en/copilot/reference/enterprise-administrators/enterprise-managed-settings) 和 Claude 的 [managed Desktop 配置](https://code.claude.com/docs/en/desktop) 都采用了“组织约束优先于用户设置”的思路，但字段与覆盖面并不相同。
+用户偏好只能在管理员上限内变窄，不能把 deny 改成 allow。还要单独检查内建文件工具、远端 MCP、浏览器工具和“审批后在沙箱外重跑”，因为它们可能不经过终端 sandbox。
+
+#### 11.2.1 OpenAI：Global 管编排，Local/Codex Cloud 管执行差异
+
+[Agent Security](https://learn.chatgpt.com/docs/enterprise/agent-security) 不是把一份 TOML 原样复制到所有运行位置，而是先区分控制面和执行面：
+
+- Global 放审批策略、web search、apps、MCP、plugins、command rules 和 managed hooks 等编排约束；
+- Local 与 Codex Cloud 只覆盖受支持的执行字段，例如 `allowed_sandbox_modes`、permission profile、文件权限、managed execution networking 和 Windows 配置；
+- Requirements 是不可越过的上限，Defaults 只是上限内的初始值；
+- 同一 policy 内，OS 专用 environment override 高于全 OS override，再回退到 Global；多条 policy 同时命中时，较高优先级 policy 胜出；
+- Local 还要服从更高优先级的 MDM 和 legacy managed-device requirements。Work Cloud 则使用自己的 cloud capability permissions，不能拿 Local 或 Codex Cloud 页面上的结果代替验收。
+
+以网络为例，Agent Security 的 managed command allowlist 与 Codex Cloud environment internet setting 是两道门：前者允许某域名，不会推翻后者的拒绝。托管 web search、apps、远端 MCP 也可能走另一条通道。因此管理员应分别测试普通 shell、批准后的 full sandbox escalation、web search 与 MCP，而不是只测试一次 `curl`。
+
+#### 11.2.2 GitHub：受管字段按“强制开启、禁止能力、路径收窄”三类合并
+
+[Enterprise managed settings](https://docs.github.com/en/copilot/reference/enterprise-administrators/enterprise-managed-settings) 对 `sandbox` 对象给出了很具体的收紧语义：
+
+```jsonc
+{
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowBypass": false,
+    "addCurrentWorkingDirectory": false,
+    "sandboxMcpServers": true,
+    "sandboxLspServers": true,
+    "gitAuth": false,
+    "ghAuth": false
+  }
+}
+```
+
+- 对 `enabled`、`failIfUnavailable` 这类 force-on 字段，managed `true` 才是强制；`false` 或省略并不会替用户关闭该功能；
+- 对 `allowBypass`、`gitAuth`、`ghAuth` 这类 capability 字段，managed `false` 表示禁止；`true` 或省略不等于强制开放；
+- managed read/write 与 read-only path 会收窄用户 grant，managed denied path 会追加到 deny；MCP denylist 也是多来源取并集；
+- `enabled: true` 单独使用仍可能留下失败降级或单命令绕过，所以企业基线通常要和 `failIfUnavailable: true`、`allowBypass: false` 一起验证。
+
+Copilot 的本地执行再交给 MXC：CLI 声明读写路径、网络和能力策略，MXC 选择当前 OS 的隔离后端。这里还有一个必须单测的缺口：CLI 内建文件工具在主进程内执行，不经过 OS sandbox，只能由工具代码自行检查 policy。
+
+#### 11.2.3 Claude：策略来源跟着执行位置走
+
+[Claude Desktop](https://code.claude.com/docs/en/desktop) 的 managed settings 覆盖 project/user settings，但 Local、Cloud、SSH 三种 session 读取的来源不同：
+
+| Session | 命令在哪里执行 | 受管配置从哪里读 | 典型控制 |
+|---|---|---|---|
+| Local | 员工电脑 | 本机 managed settings；符合条件的登录还可接收 admin console 下发 | 禁用 bypass/Auto、禁止本地 session、限制外部浏览与 MCP |
+| Cloud | Anthropic 管理的 VM，或企业配置的 self-hosted runner | server-managed settings；本机 MDM 文件不会自动进入 Anthropic VM | 云环境网络、仓库和 server-managed policy |
+| SSH | 企业远端 Linux/macOS 主机 | Claude Code 从远端主机读取 managed settings；Desktop 仍从本机读取 SSH 入口限制 | `sshConfigs`、`sshHostAllowlist`、远端 permission/MCP policy |
+
+`sshHostAllowlist` 会在 `ssh -G` 解析别名、ProxyJump 等设置后检查最终 hostname，空数组可关闭 SSH session；但它只限制 Desktop 连接入口，并不拦截 Bash 工具随后发起的任意网络请求。若要形成硬边界，还要在远端主机部署防火墙、代理或零信任网络策略。
+
+#### 11.2.4 三套策略的对照
+
+| 维度 | OpenAI Agent Security | GitHub managed settings | Claude managed Desktop |
+|---|---|---|---|
+| 最小策略单位 | Global policy + Local/Codex Cloud override | `sandbox` 及 MCP 等受管字段 | managed settings + admin console/MDM |
+| 主要合并方式 | policy 优先级、environment override、部分字段合并 | force-on、capability deny、path 收窄、deny union | managed 覆盖 project/user，来源随 Local/Cloud/SSH 改变 |
+| fail closed | 由 sandbox/approval/permission requirements 组合决定 | `enabled` + `failIfUnavailable` 明确控制 | 主要靠禁用 bypass/Auto、受管 permission rules 与运行环境本身 |
+| 需要另验的通道 | Work Cloud capabilities、web search、apps、远端 MCP、full escalation | 内建文件工具、远端 MCP、允许的 bypass | Bash 网络出口、connectors、Cloud 与 SSH 的不同 policy source |
 
 ### 11.3 厂商托管云端：重点从“保护我的电脑”转为“隔离任务与控制数据流”
 
@@ -738,7 +797,62 @@ destroy_or_hibernate(sandbox, policy.lifecycle)
 - **持久化：** VM 回收不代表快照、会话、日志和 artifact 同时删除，保留策略必须逐类核查；
 - **交付：** 默认输出 branch 或 draft PR，让 CI、CODEOWNERS、签名和人工 review 成为沙箱外的第二道门。
 
-[Cursor Cloud Agent Security](https://cursor.com/docs/cloud-agent/security) 给出了每 agent Firecracker microVM、独立账户和不同数据保留面的例子；[GitHub Copilot cloud sandbox](https://docs.github.com/en/copilot/concepts/security-governance-and-network-settings/about-cloud-and-local-sandboxes) 使用短生命周期 Linux 环境；[OpenAI Sandbox Security](https://developers.openai.com/api/docs/guides/agents-api/environments/security) 则强调按用户或工作负载隔离、收紧出口并把长期凭据留在环境外。
+#### 11.3.1 Cursor：microVM 只解决运行时隔离，仓库授权和保留期另算
+
+[Cursor Cloud Agent Security](https://cursor.com/docs/cloud-agent/security) 描述的执行链是：管理员先把 Cursor GitHub/GitLab App 安装到选定仓库，用户再连接个人 Git 身份；启动任务时，Cursor 为该 agent 创建专用 VM、clone 已授权仓库、运行工具并回传进度，最后推送 branch、建立 draft PR，再按空闲计时器休眠和回收 VM。
+
+隔离分三层：每 agent 独立 VM；运行时使用 Firecracker microVM；这些 VM 位于与 Cursor 生产服务分开的 AWS 账户。授权也有两层：组织安装范围与触发用户本身的仓库权限取交集，启动 agent 不会扩大用户原有权限。静态数据使用 AES-256，并可为企业映射客户管理的 KMS key。
+
+要注意四类数据的生命周期彼此独立：
+
+| 数据 | 位置 | 生命周期 |
+|---|---|---|
+| Runtime workspace | 当前 Cloud Agent VM | run 空闲后自动回收，后续 prompt 会刷新空闲计时 |
+| VM snapshot | VM 外的 snapshot/cache 层 | 滚动 90 天不活跃期；每次恢复重新计时，不能按单次 run 即时删除 |
+| Conversation / tool / artifact state | Cursor backend | 默认长期保存；Delete Agent API 可删除对话和 artifacts，企业可设置对话保留上限 |
+| Secrets / OAuth token | 加密 credential store | 保存到用户或管理员删除；不随 VM 回收自动消失 |
+
+所以“任务结束即销毁 VM”不能作为数据删除证明。企业还要分别配置 [Secrets & Network](https://cursor.com/docs/cloud-agent/security-network) 中的出口规则、secret scope、retention policy 和交付审查。
+
+#### 11.3.2 GitHub：本地交给 MXC，云端交给 Azure Container Apps Sandboxes
+
+[GitHub Copilot cloud and local sandboxes](https://docs.github.com/en/copilot/concepts/security-governance-and-network-settings/about-cloud-and-local-sandboxes) 把两条执行路径写得很清楚：
+
+```text
+Local: Copilot CLI/App → MXC policy → 当前 OS 的 sandbox backend → 本机 workspace
+Cloud: Copilot CLI/App → GitHub identity/policy layer → Azure Container Apps Sandbox → Linux workspace
+```
+
+本地模式限制文件、网络、凭据以及本地 MCP/LSP 子进程；云端模式则把整个交互式 CLI session 放到与本机和其他 session 隔离的 Linux 环境。云策略复用 Copilot cloud agent 的治理配置，身份、策略与计费由 GitHub 放在计算层之外。
+
+“短生命周期”也不是简单的进程退出。Cloud session 有 Active、Stopped、Deleted 三态：Stopped 会保存文件、环境变量和未完成工作以便恢复；只有 Deleted 才删除 session 与保存状态。因此验收要同时测停止、恢复、删除和管理员的 cloud sandbox access policy，不能只确认容器进程已经退出。
+
+#### 11.3.3 OpenAI：隔离、出口、应用凭据和第三方凭据分层处理
+
+[OpenAI Sandbox Security](https://developers.openai.com/api/docs/guides/agents-api/environments/security) 给出的是一套部署原则，而不是对某个 hypervisor 的承诺：不同用户或不应共享数据的 workload 使用独立环境和 OpenAI project；只允许 executor、MCP 和业务所需的目的地；应用 API key 始终留在 sandbox 外。
+
+凭据链尤其值得单独展开：
+
+```text
+应用服务：持有 OPENAI_API_KEY，创建/管理 session
+    ↓ 只把受限 environment key 交给 executor
+sandbox：可以读到 CODEX_API_KEY，但该 key 只能连接 environment
+    ↓ 对批准的第三方 host 发送占位凭据请求
+vault / trusted proxy：匹配目的地后附加真实 secret
+```
+
+OpenAI-hosted 环境可以把网络设为 `disabled`，或用 `restricted` 加 1–100 个精确 hostname；不能用 wildcard，重定向目标和子域名要单独列出。环境 template 设定的网络上限不能被 session override 放宽。文件也有两条生命周期：live workspace 随 sandbox 存在，`/workspace/outputs` 的发布副本则作为不可变 artifact 在 sandbox 过期后仍可下载。由此可见，安全基线应同时包含 session 删除、artifact 保留和密钥撤销。
+
+#### 11.3.4 云端实现对比
+
+| 维度 | Cursor Cloud Agent | GitHub Copilot cloud sandbox | OpenAI Agents API sandbox |
+|---|---|---|---|
+| 隔离说明 | 每 agent Firecracker microVM，执行环境与生产服务分账户 | 每 session 隔离 Linux，基于 Azure Container Apps Sandboxes | 要求按用户/workload 隔离；OpenAI-hosted 每 session 独立 workspace |
+| 仓库授权 | Git App 安装范围 ∩ 触发用户权限 | GitHub identity/policy layer | 由应用在创建 session 前完成身份和 repo scope 授权 |
+| 长期凭据 | Cursor credential store，按环境/用户/团队配置 | 由 GitHub 云策略与凭据机制管理 | application key 留在外部；第三方 secret 走 vault/proxy |
+| 出口 | 用户/团队/environment 规则与私网连接 | 复用 Copilot cloud agent policy | enabled / disabled / exact-host restricted |
+| 恢复与删除 | runtime、snapshot、conversation、secret 各自生命周期 | Active / Stopped / Deleted | live workspace、session、published artifact 各自生命周期 |
+| 默认交付 | branch + draft PR | 云 session 中操作仓库，仍受 GitHub policy | 由调用方设计 artifact、commit/PR 和审批链 |
 
 ### 11.4 企业自托管与混合执行：控制力更大，运维责任也全部回来
 
@@ -752,7 +866,67 @@ effective_executor_policy     = device policy + local sandbox/network controls
 effective_access              = 两侧限制的交集
 ```
 
-不要假设云端 allowlist 会自动下发到本地执行器，也不要假设本机 MDM 会约束云端容器。OpenAI [Self-hosted sandboxes](https://developers.openai.com/api/docs/guides/agents-api/environments/self-hosted) 使用 executor 主动发起的出站 WebSocket 和受限 environment key；Claude 提供 Cloud 与 SSH 两种远端路径；Cursor Self-Hosted Machines 则使用企业机器自身的防火墙、代理和网络策略。这些模式都把更多 enforcement 责任交给部署方。
+不要假设云端 allowlist 会自动下发到本地执行器，也不要假设本机 MDM 会约束云端容器。下面三种模式都由厂商保留一部分控制面，但执行通道和企业责任不同。
+
+#### 11.4.1 OpenAI self-hosted：云端 harness，企业 executor
+
+[Self-hosted sandboxes](https://developers.openai.com/api/docs/guides/agents-api/environments/self-hosted) 的连接顺序如下：
+
+```text
+企业应用 --OPENAI_API_KEY--> 创建 self_hosted session
+    ├─ 保存 session.id
+    ├─ 取得 environment.id 与 remote_url
+    └─ 为该 environment 准备受限 environment key
+
+企业 sandbox/container
+    └─ CODEX_API_KEY=<environment key>
+       codex exec-server --remote <remote_url> --environment-id <id>
+           └─ 主动建立出站 WebSocket，接收命令并回传结果
+```
+
+executor 运行 shell、读写文件并调用本地 MCP。网络只需出站访问 `api.openai.com` 做注册，以及 `wss://codex-cloud-environments.chatgpt.com` 交换命令和结果；连接中断后 executor 可以重连。每个 session 都有自己的 environment ID，并需要自己的 executor。受限 environment key 即使被 agent 代码读到，也不能用于其他 API 操作；真正的应用 key 不能进入镜像、源码或日志。
+
+这条链路解决了“厂商怎样下发任务而不打入企业内网”，没有替企业解决节点隔离。企业仍须按用户/workload 建环境，处理镜像补丁、workspace 清理、第三方 secret broker、日志脱敏和异常 executor 回收。
+
+#### 11.4.2 Claude：Cloud 与 SSH 是两种不同的信任边界
+
+[Claude Code in the cloud](https://code.claude.com/docs/en/claude-code-on-the-web) 的 Anthropic-hosted session 在隔离环境中 clone 仓库；GitHub 凭据保存在 VM 外，VM 的 Git 操作经过代理，由代理附加 scoped credential。网络由 cloud environment 定义，可限制或关闭；不过即使业务网络关闭，Claude Code 仍需与 Anthropic API 通信。
+
+[Claude Desktop 的 SSH session](https://code.claude.com/docs/en/desktop) 则把 Claude Code 自动安装并运行在企业 Linux/macOS 主机上：
+
+```text
+Desktop UI → SSH/ProxyJump → 企业 devbox 上的 Claude Code
+                              ├─ 读取远端文件与工具
+                              ├─ 读取远端 managed settings
+                              └─ 使用远端主机的网络、用户权限与凭据
+```
+
+本机 Desktop 的 `sshHostAllowlist` 只筛选最终解析出的目标 hostname；真正的命令边界仍由 devbox 的 OS sandbox、账户、容器、firewall 和 proxy 决定。代码与构建缓存可以留在企业主机，但会话和模型所需的代码上下文仍会发送到所配置的模型提供方。
+
+#### 11.4.3 Cursor Self-Hosted Machines：工具在企业侧，agent loop 仍在 Cursor
+
+[Cursor Self-Hosted Machines](https://cursor.com/docs/cloud-agent/self-hosted) 把文件编辑、终端命令、computer use 和本地 MCP 放到企业 worker；agent loop、推理和规划仍由 Cursor 执行。worker 主动访问 `api2.cursor.sh`、`api2direct.cursor.sh`，并可向 `cloud-agent-artifacts.s3.us-east-1.amazonaws.com` 上传 artifact，不要求入站端口、公网 IP 或 VPN tunnel。
+
+```text
+Cursor agent loop ⇄ 出站会话连接 ⇄ 企业 worker
+                                      ├─ repo checkout / build cache
+                                      ├─ machine-local credentials
+                                      ├─ terminal / file / MCP tools
+                                      └─ 企业 firewall / HTTPS_PROXY
+```
+
+完整 checkout、build cache 和 machine-local credentials 留在 worker；但模型读取的文件片段、terminal output、diff、截图、本地 MCP 结果和 routing metadata 会发往 Cursor，artifact 也可能进入 Cursor 存储。My Machines 使用机器已有凭据；Team Pool 可以通过 `--sync-dashboard-secrets` 接收与本次仓库匹配的 team/user secrets。环境级 secret 与 Build Secret 不会同步到 worker。
+
+#### 11.4.4 混合执行对比
+
+| 维度 | OpenAI self-hosted | Claude SSH / self-hosted cloud | Cursor Self-Hosted Machines |
+|---|---|---|---|
+| 厂商侧保留 | agent harness、session 与模型服务 | Desktop/Cloud 控制面与模型服务 | agent loop、推理、计划与 dashboard |
+| 企业侧执行 | `codex exec-server` 所在环境 | SSH devbox 或 self-hosted runner | My Machines / Team Pool worker |
+| 连接方向 | executor 主动出站 WebSocket | Desktop 主动 SSH；self-hosted runner 另按部署配置 | worker 主动出站 HTTPS/session |
+| 沙箱凭据 | 只能连接 environment 的 key | hosted Git 凭据可由外部代理；SSH 使用远端主机凭据 | My Machines 用本机凭据；Pool 可选 secret sync |
+| 企业必须补齐 | 每 workload 隔离、egress、secret broker、清理 | SSH host 的 OS 隔离、网络、patch、远端 policy | worker 隔离、firewall/proxy、artifact/telemetry 审查 |
+| 仍会离开企业边界 | 命令结果、文件/模型上下文、session 事件 | 对话与模型所需代码上下文 | 文件片段、输出、diff、截图、MCP 结果及可选 artifacts |
 
 ### 11.5 验收表要同时覆盖本地与云端
 
@@ -823,7 +997,7 @@ namespace/Seatbelt 规则通常随进程消失；Windows ACL、mandatory label�
 - OpenHands：[`DockerWorkspace`](https://github.com/OpenHands/software-agent-sdk/blob/de30ec0111fc1c1435a1639d4ec27aead297d5b8/openhands-workspace/openhands/workspace/docker/workspace.py)、[`LocalWorkspace`](https://github.com/OpenHands/software-agent-sdk/blob/de30ec0111fc1c1435a1639d4ec27aead297d5b8/openhands-sdk/openhands/sdk/workspace/local.py)
 - Hermes Agent（2026-10-07 读取 `main`）：[`SECURITY.md`](https://github.com/NousResearch/hermes-agent/blob/main/SECURITY.md)、[`config_defaults.py`](https://github.com/NousResearch/hermes-agent/blob/main/hermes_cli/config_defaults.py)、[`docker.py`](https://github.com/NousResearch/hermes-agent/blob/main/tools/environments/docker.py)、[`code_execution_tool.py`](https://github.com/NousResearch/hermes-agent/blob/main/tools/code_execution_tool.py)、[`file_tools.py`](https://github.com/NousResearch/hermes-agent/blob/main/tools/file_tools.py)、[`file_safety.py`](https://github.com/NousResearch/hermes-agent/blob/main/agent/file_safety.py)、[`Dockerfile`](https://github.com/NousResearch/hermes-agent/blob/main/Dockerfile)、[`docker-compose.yml`](https://github.com/NousResearch/hermes-agent/blob/main/docker-compose.yml)
 - NVIDIA OpenShell：[`architecture/sandbox.md`](https://github.com/NVIDIA/OpenShell/blob/main/architecture/sandbox.md)
-- OpenAI：[Agent Security](https://learn.chatgpt.com/docs/enterprise/agent-security)、[Sandbox Security](https://developers.openai.com/api/docs/guides/agents-api/environments/security)、[Self-hosted sandboxes](https://developers.openai.com/api/docs/guides/agents-api/environments/self-hosted)
+- OpenAI：[Agent Security](https://learn.chatgpt.com/docs/enterprise/agent-security)、[Sandbox Security](https://developers.openai.com/api/docs/guides/agents-api/environments/security)、[OpenAI-hosted sandboxes](https://developers.openai.com/api/docs/guides/agents-api/environments/openai-hosted)、[Self-hosted sandboxes](https://developers.openai.com/api/docs/guides/agents-api/environments/self-hosted)
 - Claude Code：[Desktop / Local / Cloud / SSH](https://code.claude.com/docs/en/desktop)、[Claude Code in the cloud](https://code.claude.com/docs/en/claude-code-on-the-web)
-- Cursor：[Cloud Agent Security](https://cursor.com/docs/cloud-agent/security)、[Secrets & Network](https://cursor.com/docs/cloud-agent/security-network)
+- Cursor：[Cloud Agent Security](https://cursor.com/docs/cloud-agent/security)、[Secrets & Network](https://cursor.com/docs/cloud-agent/security-network)、[Self-Hosted Machines](https://cursor.com/docs/cloud-agent/self-hosted)
 - GitHub Copilot：[Cloud and local sandboxes](https://docs.github.com/en/copilot/concepts/security-governance-and-network-settings/about-cloud-and-local-sandboxes)、[Enterprise managed settings](https://docs.github.com/en/copilot/reference/enterprise-administrators/enterprise-managed-settings)
