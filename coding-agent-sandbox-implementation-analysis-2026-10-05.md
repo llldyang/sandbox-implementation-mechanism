@@ -568,7 +568,84 @@ args = [
 
 同一仓库还提供 Apptainer、cloud、remote API 与 agent-sandbox backend。以产品名笼统标成“Docker sandbox”会隐藏真实边界。
 
-## 9. 实现层横向对照
+## 9. Hermes Agent：可插拔执行后端与整进程包裹
+
+补充核查点：`NousResearch/hermes-agent` 的 `main`，读取于 2026-10-07。本节链接未固定提交；Hermes 更新较快，复查或上线前应把链接换成实际部署版本的 commit。
+
+### 9.1 默认 local，后端工厂决定命令最终在哪里执行
+
+[`config_defaults.py`](https://github.com/NousResearch/hermes-agent/blob/main/hermes_cli/config_defaults.py#L291) 把 `terminal.backend` 的默认值设为 `local`。这时 Hermes 仍有审批模式、敏感路径检查和安全写入根目录，但命令本身使用宿主用户的文件与网络权限；这些工具层检查不是 OS sandbox。
+
+非本地模式的关键不是在每个工具里各写一套 Docker 调用，而是先按任务取得共享环境，再让工具通过这个环境执行：
+
+```python
+config = get_environment_config()
+env = active_environments.get(task_id)
+
+if env is None:
+    env = create_environment(backend=config.backend, config=config)
+    active_environments[task_id] = env
+
+terminal_result = env.execute(command)
+file_ops = ShellFileOperations(env)
+
+if backend != "local":
+    code_result = env.execute(build_remote_script(code, language))
+```
+
+这段是对 [`file_tools.py`](https://github.com/NousResearch/hermes-agent/blob/main/tools/file_tools.py)、[`code_execution_tool.py`](https://github.com/NousResearch/hermes-agent/blob/main/tools/code_execution_tool.py#L366) 和环境工厂调用关系的压缩。当前 `main` 的非本地 `execute_code` 已复用环境；但 [`SECURITY.md`](https://github.com/NousResearch/hermes-agent/blob/main/SECURITY.md) 仍保留了代码执行不受 terminal backend 覆盖的旧说明。这里应视为源码与文档的版本差，不应据 `main` 推断所有已发布版本。
+
+### 9.2 Docker 后端：先启动长期容器，再用 docker exec 复用
+
+[`tools/environments/docker.py`](https://github.com/NousResearch/hermes-agent/blob/main/tools/environments/docker.py) 先拼出容器参数，执行一次 `docker run -d ... sleep infinity`；此后的命令用 `docker exec ... bash` 进入同一容器。开启持久化时，容器和工作状态可以跨会话保留。
+
+```python
+security_args = [
+    "--cap-drop", "ALL",
+    "--cap-add", "DAC_OVERRIDE",
+    "--cap-add", "CHOWN",
+    "--cap-add", "FOWNER",
+    "--security-opt", "no-new-privileges",
+    "--tmpfs", "/tmp:rw,nosuid,size=512m",
+    "--tmpfs", "/var/tmp:rw,noexec,nosuid,size=256m",
+]
+
+if cgroup_limits_supported:
+    security_args += ["--pids-limit", "2048", "--cpus", cpus, "--memory", memory]
+if not docker_network:
+    security_args += ["--network=none"]
+
+run("docker", "run", "-d", *security_args, *mounts,
+    *docker_extra_args, image, "sleep", "infinity")
+run("docker", "exec", container, "bash", "-lc", command)
+```
+
+真实代码还会为 s6 镜像调整 `/run`，在需要切换用户时补 `SETUID` / `SETGID`。安全结论要同时看默认值和参数顺序：
+
+- `docker_network` 默认为 `True`，所以默认不是 `--network=none`；
+- `container_persistent` 默认为 `True`，状态不会随单条命令消失；
+- 当前源码没有为根文件系统追加 `--read-only`；
+- cgroup 探测失败时，CPU、内存和 PID 限制会降级；
+- Snap 兼容模式会省略 `no-new-privileges`；
+- `docker_extra_args` 最后追加，能够改变前面生成的 Docker 参数。
+
+所以准确说法是“Docker 后端提供可配置的容器边界”，不是“启用后自动得到固定强度、默认断网的沙箱”。
+
+### 9.3 文件护栏和凭据代理解决的是另一层问题
+
+[`agent/file_safety.py`](https://github.com/NousResearch/hermes-agent/blob/main/agent/file_safety.py) 通过 `HERMES_WRITE_SAFE_ROOT` 限制文件工具的写入根，并拒绝常见的 SSH、云凭据和系统敏感路径。它对减少误操作有用，但 local backend 中的 shell 命令可以绕开 Python 文件工具，因此不能代替进程级文件隔离。
+
+Iron Proxy 是可选的 Docker 出口代理：沙箱里只放入不透明 token，宿主代理再替换真实凭据并执行域名策略。它避免把 API key 直接塞进容器，但默认关闭，而且必须配合容器网络限制，才能防止程序绕过代理直接出网。
+
+### 9.4 要覆盖插件、MCP 和 hooks，需要包裹整个 Hermes 进程
+
+只切换 terminal backend，主要覆盖送入该环境的终端、文件和代码执行。Hermes 主进程仍可能在宿主上加载插件、MCP、hooks 和 skills。官方安全说明因此另列“整进程隔离”：使用官方 [`Dockerfile`](https://github.com/NousResearch/hermes-agent/blob/main/Dockerfile) / [`docker-compose.yml`](https://github.com/NousResearch/hermes-agent/blob/main/docker-compose.yml)，或把进程放进 [NVIDIA OpenShell](https://github.com/NVIDIA/OpenShell/blob/main/architecture/sandbox.md)。
+
+官方镜像让服务以 UID 10000 的非 root 用户运行，并把可写主目录放到 `/opt/data`。不过当前 Compose 使用 `network_mode: host`，还把 `~/.hermes` 可写挂载到 `/opt/data`，因此默认 Compose 更像方便部署的进程边界，不是严格最小权限配置。
+
+OpenShell 的边界更系统：非 root 且身份不可变、零 capabilities、`no_new_privs`、Landlock、seccomp 和 L7 网络策略一起生效，凭据通过 provider 占位符注入。对于不可信仓库或第三方插件，这类整进程包裹比单独把终端切到 Docker 更完整。
+
+## 10. 实现层横向对照
 
 | 实现 | 文件边界怎样落地 | 网络边界怎样落地 | 子进程/生命周期 | 最重要的例外 |
 |---|---|---|---|---|
@@ -582,19 +659,20 @@ args = [
 | Gemini Windows manager | Low IL token + 对宿主文件写 ACL/label | Job bandwidth=1 | suspended create → assign Job → resume | 网络失败只 warning；ACL/label 可能残留 |
 | VS Code Windows | MXC policy → PSEC / fallback | MXC overall allow/block | `wxc-exec`/ProcessContainer | 无逐域名网络策略；home deny TODO |
 | OpenHands Docker | Docker mount namespace，由 `-v` 打开宿主路径 | Docker 网络；默认不等于断网 | 容器 + agent server | 没有自动 `--read-only` / cap drop |
+| Hermes Docker backend | 容器文件系统与显式 volumes；文件工具另有 safe-root 检查 | 默认允许 Docker 网络；可选 `--network=none` / Iron Proxy | 长期容器 + `docker exec` | 默认 local 无隔离；持久化和网络默认开启；插件/MCP 需整进程隔离 |
 | OpenCode / OpenHands Local | 宿主原权限 | 宿主网络 | 普通宿主进程 | 没有内建 OS 沙箱 |
 
-## 10. 从这些源码可以提炼出的实现原则
+## 11. 从这些源码可以提炼出的实现原则
 
-### 10.1 策略应保留“读、写、拒绝”的结构直到平台编译层
+### 11.1 策略应保留“读、写、拒绝”的结构直到平台编译层
 
 过早把它们压成“工作区可写”会丢失 `.git` 只读、秘密文件不可读、嵌套 carve-out 等语义。Codex、SRT 和 Gemini 新 manager 都在平台层仍携带分开的路径集合。
 
-### 10.2 mount/规则顺序是安全逻辑，不只是参数排列
+### 11.2 mount/规则顺序是安全逻辑，不只是参数排列
 
 典型安全顺序是“宽泛基线 → 开放必要根 → 重新覆盖敏感子路径 → 最后追加不可绕开的 deny”。Bubblewrap 和 Seatbelt 实现都依赖这个顺序。父/子路径排序错误会让宽泛父挂载遮掉精细子挂载。
 
-### 10.3 网络 allowlist 至少需要两层
+### 11.3 网络 allowlist 至少需要两层
 
 域名属于应用层语义，namespace/WFP/Seatbelt 属于内核强制。较完整的设计是：
 
@@ -606,29 +684,29 @@ args = [
 
 只设置 `HTTPS_PROXY` 没有强制力；只给 namespace 断网则无法提供受控网络。
 
-### 10.4 helper 必须位于被约束进程之外，但又不能被它操纵
+### 11.4 helper 必须位于被约束进程之外，但又不能被它操纵
 
 SRT 用嵌套 PID namespace 让用户命令看不到未过滤的 socat；Codex 限制 app-server/daemon Unix socket；Windows 独立用户让 surrogate spawn 仍带 sandbox SID。这些代码都在解决同一个问题：代理、runner、broker 本身如果能被不可信命令附加、注入或通过 IPC 调用，沙箱就可能被“借权”。
 
-### 10.5 缺失能力必须显式失败或显式降级
+### 11.5 缺失能力必须显式失败或显式降级
 
 较好的源码证据包括：Codex WSL1 提前拒绝、SRT nested namespace 失败即中止、MXC 请求级 capability probe、Gemini 指定 runtime 不存在时报错。反例是 Gemini Windows 的网络限速设置失败只 warning；调用方若需要严格断网，就不能把该分支视为满足要求。
 
-### 10.6 修改宿主 ACL/完整性标签需要事务与恢复
+### 11.6 修改宿主 ACL/完整性标签需要事务与恢复
 
 namespace/Seatbelt 规则通常随进程消失；Windows ACL、mandatory label、WFP provider 和本地账户是持久状态。SRT 用 holder 引用计数与 restore/revoke；MXC 记录孤儿 DACL 状态；Codex 有独立 setup/uninstall 流程。任何自研 Windows 沙箱都需要把“恢复失败”和“进程崩溃后清理”当成主流程，而不是附加脚本。
 
-## 11. 结论
+## 12. 结论
 
 从固定仓库源码看，主流实现大致分为三种工程路线：
 
 1. **本地策略编译器**：Codex、SRT、Gemini 新 manager 把统一权限模型编译成 Seatbelt/Bubblewrap/Windows 原语，启动快、与本地工具兼容，但需要大量平台专用的路径、IPC 和失败处理。
 2. **统一执行容器层**：MXC 把策略变成后端配置，并在 Windows 走 PSEC/ProcessContainer，在其他平台接 Bubblewrap/Seatbelt。抽象更统一，但保证取决于后端 capability 和 SDK 成熟度。
-3. **外部环境后端**：OpenHands Docker/Apptainer 把整个 agent server 放入容器，边界更粗；安全性由镜像、挂载、网络与 runtime 参数共同决定。LocalWorkspace/OpenCode 则没有 OS 隔离层。
+3. **外部环境后端**：OpenHands Docker/Apptainer 把 agent server 放入容器；Hermes 可以只把工具调用送入 Docker，也可以包装整个主进程。边界强度由镜像、挂载、网络、凭据与 runtime 参数共同决定。OpenHands LocalWorkspace、Hermes 默认 local 和 OpenCode 则没有 OS 隔离层。
 
 不能用一个“已开启 sandbox”的布尔值比较它们。实际验收至少要分别检查：项目外读取、写入、符号链接、Unix socket/命名管道、直接网络、代理绕过、子进程与后台进程、提权路径、持久 ACL，以及底层能力缺失时的行为。
 
-## 12. 固定源码索引
+## 13. 源码索引
 
 - Codex Linux：[README](https://github.com/openai/codex/blob/7f892275e31002f0422477c6219189284560e689/codex-rs/linux-sandbox/README.md)、[`linux_run_main.rs`](https://github.com/openai/codex/blob/7f892275e31002f0422477c6219189284560e689/codex-rs/linux-sandbox/src/linux_run_main.rs)、[`bwrap.rs`](https://github.com/openai/codex/blob/7f892275e31002f0422477c6219189284560e689/codex-rs/linux-sandbox/src/bwrap.rs)、[`landlock.rs`](https://github.com/openai/codex/blob/7f892275e31002f0422477c6219189284560e689/codex-rs/linux-sandbox/src/landlock.rs)
 - Codex macOS：[`seatbelt.rs`](https://github.com/openai/codex/blob/7f892275e31002f0422477c6219189284560e689/codex-rs/sandboxing/src/seatbelt.rs)
@@ -639,3 +717,5 @@ namespace/Seatbelt 规则通常随进程消失；Windows ACL、mandatory label�
 - MXC：[README](https://github.com/microsoft/mxc/blob/2044eac07ad819319e924ae3d3a5f427a79c9afb/README.md)、[ProcessContainer guide](https://github.com/microsoft/mxc/blob/2044eac07ad819319e924ae3d3a5f427a79c9afb/docs/process-container/guide.md)、[networking](https://github.com/microsoft/mxc/blob/2044eac07ad819319e924ae3d3a5f427a79c9afb/docs/process-container/networking.md)、[`secenv.rs`](https://github.com/microsoft/mxc/blob/2044eac07ad819319e924ae3d3a5f427a79c9afb/src/backends/process_container/common/src/secenv.rs)、[`dispatcher.rs`](https://github.com/microsoft/mxc/blob/2044eac07ad819319e924ae3d3a5f427a79c9afb/src/backends/process_container/common/src/dispatcher.rs)
 - OpenCode：[`SECURITY.md`](https://github.com/anomalyco/opencode/blob/907b3bc518fa48e90e8ec24dd327d13eee71c36c/SECURITY.md)
 - OpenHands：[`DockerWorkspace`](https://github.com/OpenHands/software-agent-sdk/blob/de30ec0111fc1c1435a1639d4ec27aead297d5b8/openhands-workspace/openhands/workspace/docker/workspace.py)、[`LocalWorkspace`](https://github.com/OpenHands/software-agent-sdk/blob/de30ec0111fc1c1435a1639d4ec27aead297d5b8/openhands-sdk/openhands/sdk/workspace/local.py)
+- Hermes Agent（2026-10-07 读取 `main`）：[`SECURITY.md`](https://github.com/NousResearch/hermes-agent/blob/main/SECURITY.md)、[`config_defaults.py`](https://github.com/NousResearch/hermes-agent/blob/main/hermes_cli/config_defaults.py)、[`docker.py`](https://github.com/NousResearch/hermes-agent/blob/main/tools/environments/docker.py)、[`code_execution_tool.py`](https://github.com/NousResearch/hermes-agent/blob/main/tools/code_execution_tool.py)、[`file_tools.py`](https://github.com/NousResearch/hermes-agent/blob/main/tools/file_tools.py)、[`file_safety.py`](https://github.com/NousResearch/hermes-agent/blob/main/agent/file_safety.py)、[`Dockerfile`](https://github.com/NousResearch/hermes-agent/blob/main/Dockerfile)、[`docker-compose.yml`](https://github.com/NousResearch/hermes-agent/blob/main/docker-compose.yml)
+- NVIDIA OpenShell：[`architecture/sandbox.md`](https://github.com/NVIDIA/OpenShell/blob/main/architecture/sandbox.md)

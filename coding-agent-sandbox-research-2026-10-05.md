@@ -1,11 +1,5 @@
 # 主流 Coding Agent 跨操作系统沙箱机制调研
 
-调研基准：2026-10-05，Asia/Shanghai。方法：官方资料交叉检查、固定 Git 提交的静态源码阅读；**没有在 macOS、Linux、Windows 上分别运行攻防测试**。
-
-这里的“主流”指有代表性的终端、IDE 和自主开发代理，不是市场份额排名。比较的是 agent 执行命令、访问文件和使用网络的边界，不是 Electron 渲染器沙箱，也不把 Git worktree 当成安全沙箱。
-
-**版本口径：产品文档声明、源码快照中存在的实现、已安装版本真正启用的能力，是三回事。** 本文保留这些区别；默认分支源码不能证明对应能力已进入稳定版。文中的 D/R 编号对应末尾资料索引。
-
 ## 1. 核心结论
 
 1. **审批不等于隔离。** “执行前询问”“允许此命令”主要控制是否调用工具；真正的 OS 沙箱在程序启动后继续约束它和子进程。OpenCode 的安全政策直接把权限系统与安全隔离区分开。[R14]
@@ -13,6 +7,7 @@
 3. **Windows 不存在统一答案。** 受限令牌/ACL、独立用户/WFP、MXC ProcessContainer，以及 WSL2 中的 Linux 沙箱，是不同路线；也不能把它们都叫成系统自带的 Windows Sandbox 虚拟机。[D1、D5、D6、R4、R5、R7、R13]
 4. **必须读当前源码。** Codex 的 Linux 默认实现已是 Bubblewrap；Claude Code 产品文档仍不宣称原生 Windows 沙箱，但公开 SRT 源码已加入 Windows 后端；Gemini 的 Windows 原生后端也不只是“Docker 的另一种写法”。[R1、D2、R7、R10]
 5. **开启 sandbox 不等于默认断网、不能读取家目录、具备 VM 级隔离。** 文件读取、写入、网络、IPC、提权和例外机制应分别核查。[D1、D2、D3、D6、R13]
+6. **Hermes Agent 有可选沙箱，但默认本地后端不是沙箱。** `terminal.backend` 默认为 `local`；只有切换到 Docker、Singularity、Modal 等隔离环境，或把 Hermes 整体放进 Docker / OpenShell，才会得到相应的 OS 边界。[D9、R16]
 
 ## 2. 产品 × 操作系统总览
 
@@ -26,6 +21,7 @@
 | Cursor Agent | Seatbelt | 官方说明为 Landlock，兼容性需要时回退 Bubblewrap | Windows 通过 WSL2 使用 Linux 路线，不是同一套原生 Windows 隔离 | 官方产品/工程说明；未据公开资料重建完整内部调用链 [D4] |
 | VS Code Local / Agent Host 自定义终端 | SRT 路线，底层 Seatbelt | SRT 路线，底层 Bubblewrap | 原生 Windows 使用 MXC；WSL2 按 Linux 处理；有预览状态和系统前提 | VS Code 集成层公开；当前源码包名为 `@vscode/sandbox-runtime`；不代表 Agent Host 内建 shell [D5、R11、R12] |
 | GitHub Copilot CLI | MXC 的 Seatbelt 后端 | MXC 的 Bubblewrap 后端 | MXC ProcessContainer 的 BaseContainer；不使用 AppContainer 回退，要求相应 Windows 能力 | CLI 本地沙箱整体仍为实验性，且默认关闭；不与 VS Code 集成混为一谈 [D6、R13] |
+| Hermes Agent | 默认 `local`，无 Hermes 原生 Seatbelt 后端；可把终端放入 Docker/远端环境，或包装整个进程 | 默认 `local`，无内建 Bubblewrap/Landlock 后端；可选 Docker、Singularity、Modal、SSH 等 | 原生运行时默认同样是 `local`；Docker Desktop 路线借助 Linux VM/WSL2，不是 Hermes 原生 Windows 沙箱 | “有 sandbox backend”不等于默认受隔离；插件、MCP、hooks 等是否被覆盖取决于只隔离终端还是包装整个进程 [D9、R16] |
 | OpenCode | 不提供内建 OS 沙箱 | 同左 | 同左 | 安全政策明确写明 No Sandbox；需外置容器/VM [R14] |
 | OpenHands | 取决于选择的 workspace/backend | 同左 | 同左；Docker 路线还依赖宿主的容器环境 | `DockerWorkspace` 是容器路线；`LocalWorkspace` 直接操作宿主，不能笼统说“OpenHands 总在 Docker 内” [R15] |
 
@@ -103,7 +99,17 @@ MXC 的 ProcessContainer 指南展示的链路是：SDK 生成配置 → `wxc-ex
 
 **重要限制：本次固定的 MXC README 明确提示仍是早期预览，存在过宽策略，当前不应把其 profile 当成安全边界。** 本文因此不把“接入 MXC”写成“已获得 VM 等级的安全保证”。[R13]
 
-### 4.5 两个反例：有 permission 或 workspace，不代表有隔离
+### 4.5 Hermes Agent：默认 local，无条件信任时应更换后端或包装整个进程
+
+Hermes 的隔离边界由 `terminal.backend` 决定。默认配置是 `local`，命令直接由宿主进程执行；审批模式、`HERMES_WRITE_SAFE_ROOT` 和敏感路径拒绝规则只是工具层护栏，不能约束一条已经获准执行的任意 shell 命令。[D9、R16]
+
+切换到非本地后端后，终端和文件工具会共用同一个环境对象。当前 `main` 中，非本地 `execute_code` 也经 `_get_or_create_env()` 进入该环境。不过 `SECURITY.md` 仍保留“代码执行不受 terminal backend 覆盖”的保守描述，说明文档与源码存在时间差；做稳定部署时应以所用版本实测，而不是把 `main` 的行为外推到旧版本。[D9、R16]
+
+Docker 后端会创建长期运行的容器，再通过 `docker exec` 执行后续命令。它默认丢弃全部 capabilities，只按运行需要补回少数能力，并设置 `no-new-privileges`、受限 tmpfs 和资源参数。但默认配置同时允许网络、保留容器，源码也没有自动加入 `--read-only`；用户提供的 `docker_extra_args` 最后追加，还可能改变前面生成的限制。因此它是一个可配置的容器后端，不是固定强度的“安全模式”。[R16]
+
+若输入仓库、插件或 MCP 服务不可信，只隔离终端仍会留下 Hermes 主进程这一侧的解析、hooks 和扩展面。官方安全说明把“终端后端隔离”和“整个 Hermes 进程隔离”分开：后者可用官方 Docker 镜像/Compose，或 NVIDIA OpenShell。OpenShell 再叠加非 root 身份、零 capabilities、`no_new_privs`、Landlock、seccomp 与网络策略，边界明显更完整。[D9、D10、R16]
+
+### 4.6 两个反例：有 permission 或 workspace，不代表有隔离
 
 **OpenCode：** `SECURITY.md` 明确说明 agent 没有被 sandbox，permission 是让用户了解行为的交互机制，而非安全隔离。需要真正隔离时，应另放入容器/VM。这个结论来自维护者的威胁模型，不是对源码“没有搜到 sandbox”的猜测。[R14]
 
@@ -116,6 +122,7 @@ MXC 的 ProcessContainer 指南展示的链路是：SDK 生成配置 → `wxc-ex
 - **写保护不是读保护。** 项目外不可写，并不推出 SSH key、浏览器配置或环境变量不可读；广泛可读加宽泛网络出口仍然需要评估。[D1–D3]
 - **代理配置不是出口强制。** 看的是直接 socket 能否绕过代理、代理策略在哪一层执行，而不只是存在 `HTTPS_PROXY`。[R1、R6、D6]
 - **沙箱覆盖范围不是整个应用。** Claude 文档主要描述 Bash 子树；VS Code 文档主要描述 agent 终端并有独立 MCP 设置；远端 MCP、HTTP 工具和外部服务必须另画边界。[D2、D5]
+- **执行后端隔离不等于主进程隔离。** Hermes 的 Docker terminal backend 约束进入该后端的终端、文件及当前源码中的非本地代码执行；插件、MCP、hooks 和 skill 加载仍要看 Hermes 主进程是否也被放进容器或 OpenShell。[D9、R16]
 - **例外和降级同样重要。** 是否允许审批后沙箱外运行、依赖缺失是否拒绝执行、管理员策略能否强制启用，都影响最终保证。Copilot CLI 文档对没有可用沙箱时的会话行为和强制策略作了区分。[D2、D6]
 - **本地容器不等于“宿主的一切都隔离了”。** Docker Desktop 的 Linux 容器位于 Linux VM 中，但宿主共享目录仍然是明确打开的访问面；OpenHands 的 DockerWorkspace 也允许额外挂载目录。[D7、R15]
 - **机制不是完整安全证明。** 产品安装版本、系统内核、Windows build、挂载配置和网络配置不同，实际保证就可能不同。本文不据静态分析为任何产品出具“不可逃逸”保证。
@@ -128,6 +135,7 @@ MXC 的 ProcessContainer 指南展示的链路是：SDK 生成配置 → `wxc-ex
 2. **Windows 需求单独列验收项：** 不要把 WSL2、受限令牌、独立用户/WFP、MXC 当成一个功能勾选框。特别记录是否改变 ACL/完整性标签、是否需要管理员安装、网络限制是否真的强制执行。[D1、R7、R10、R13]
 3. **不可信仓库、无人值守、共享服务：** 将“本地便利型原生沙箱”与“隔离运行环境”分层设计。可以考虑单独 VM 或 gVisor 等更强隔离路线，同时最小化挂载和凭据；gVisor 的安全目标也是减少对宿主内核的直接接触，并非宣称零风险。[D8]
 4. **权限模型至少拆分：** 文件读、文件写、网络出口、进程/IPC、凭据、沙箱外提权和远端工具。不要只有一个 `allow_shell` 或 `sandbox=true`。
+5. **插件较多的 Agent：** 如果只把 shell 放进容器，还要单独审计宿主上的插件、MCP、hooks 和凭据加载。Hermes 的两种部署姿态正好说明了“隔离工具”和“隔离整个 Agent”之间的差别。[D9、D10]
 
 建议验收使用无敏感数据的临时目录、假凭据和自有测试服务：检查项目外读写、符号链接、子进程继承、直接网络连接、宿主 socket/管道访问、后台子进程清理、沙箱依赖失效及审批后边界变化。**这些是后续建议，本文没有执行这些测试。**
 
@@ -145,6 +153,9 @@ MXC 的 ProcessContainer 指南展示的链路是：SDK 生成配置 → `wxc-ex
 | OpenHands/OpenHands | `64f12b3a3294aa78e850c2b0ec32f6bef04ba5fd` | 2026-10-05 15:01:55 |
 | microsoft/mxc | `2044eac07ad819319e924ae3d3a5f427a79c9afb` | 2026-10-03 12:38:35 |
 | OpenHands/software-agent-sdk | `de30ec0111fc1c1435a1639d4ec27aead297d5b8` | 2026-10-05 15:44:17 |
+| NousResearch/hermes-agent | `main`（本次补充未固定 SHA） | 2026-10-07 核查 |
+
+Hermes Agent 更新较快，本次补充按 2026-10-07 可见的 `main` 阅读，并保留 `main` 链接；后续复查时应重新固定提交。
 
 ## 8. 资料与源码索引
 
@@ -163,6 +174,9 @@ MXC 的 ProcessContainer 指南展示的链路是：SDK 生成配置 → `wxc-ex
 - D7 — Docker Desktop VM / 文件共享架构：`https://docs.docker.com/desktop/features/networking/`
 - D7 — Docker Desktop Windows 权限边界：`https://docs.docker.com/desktop/setup/install/windows-permission-requirements/`
 - D8 — gVisor security model：`https://gvisor.dev/docs/architecture_guide/security/`
+- D9 — Hermes Agent security policy：`https://github.com/NousResearch/hermes-agent/blob/main/SECURITY.md`
+- D9 — Hermes Agent security guide：`https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/security.md`
+- D10 — NVIDIA OpenShell sandbox architecture：`https://github.com/NVIDIA/OpenShell/blob/main/architecture/sandbox.md`
 
 ### 固定提交源码
 
@@ -189,3 +203,9 @@ MXC 的 ProcessContainer 指南展示的链路是：SDK 生成配置 → `wxc-ex
 - R15 — OpenHands 当前部署方式：`https://github.com/OpenHands/OpenHands/blob/64f12b3a3294aa78e850c2b0ec32f6bef04ba5fd/README.md`
 - R15 — DockerWorkspace：`https://github.com/OpenHands/software-agent-sdk/blob/de30ec0111fc1c1435a1639d4ec27aead297d5b8/openhands-workspace/openhands/workspace/docker/workspace.py#L53`
 - R15 — LocalWorkspace：`https://github.com/OpenHands/software-agent-sdk/blob/de30ec0111fc1c1435a1639d4ec27aead297d5b8/openhands-sdk/openhands/sdk/workspace/local.py#L17`
+- R16 — Hermes 默认终端配置：`https://github.com/NousResearch/hermes-agent/blob/main/hermes_cli/config_defaults.py#L291`
+- R16 — Hermes Docker 后端：`https://github.com/NousResearch/hermes-agent/blob/main/tools/environments/docker.py`
+- R16 — Hermes 代码执行环境选择：`https://github.com/NousResearch/hermes-agent/blob/main/tools/code_execution_tool.py#L366`
+- R16 — Hermes 文件工具环境选择：`https://github.com/NousResearch/hermes-agent/blob/main/tools/file_tools.py`
+- R16 — Hermes 文件工具护栏：`https://github.com/NousResearch/hermes-agent/blob/main/agent/file_safety.py`
+- R16 — Hermes 整进程镜像与 Compose：`https://github.com/NousResearch/hermes-agent/blob/main/Dockerfile`、`https://github.com/NousResearch/hermes-agent/blob/main/docker-compose.yml`
